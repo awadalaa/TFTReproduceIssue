@@ -1,7 +1,7 @@
 import os
+import json
 import itertools
 import apache_beam as beam
-from typing import List
 import tensorflow as tf
 import tensorflow_transform as tft
 import tensorflow_transform.beam as tft_beam
@@ -9,8 +9,15 @@ import tensorflow_transform.beam as tft_beam
 from abc import ABC, abstractmethod
 from tensorflow_transform.tf_metadata import dataset_metadata
 from tensorflow_transform.tf_metadata import schema_utils
-from data import coders
+from typing import List
 
+
+class JsonCoder(object):
+  def encode(self, x):
+      return json.dumps(x)
+
+  def decode(self, x):
+      return json.loads(x)
 
 class BaseRawFeatureSchema(ABC):
     @abstractmethod
@@ -101,7 +108,7 @@ class BaseTFTRunner(ABC):
 
             raw_train_data = (
                     pipeline
-                    | "ReadTrainInputs" >> beam.io.ReadFromText(input_train_file, coder=coders.JsonCoder())
+                    | "ReadTrainInputs" >> beam.io.ReadFromText(input_train_file, coder=JsonCoder())
                     | "PreFormatTrainData" >> beam.Map(self.prepare_for_transform)
             )
             _ = raw_data_metadata | "WriteRawMetadata" >> tft_beam.WriteMetadata(
@@ -130,7 +137,7 @@ class BaseTFTRunner(ABC):
 
             raw_test_data = (
                     pipeline
-                    | "ReadTestInputs" >> beam.io.ReadFromText(input_test_file, coder=coders.JsonCoder())
+                    | "ReadTestInputs" >> beam.io.ReadFromText(input_test_file, coder=JsonCoder())
                     | "PreFormatTestData" >> beam.Map(self.prepare_for_transform)
             )
 

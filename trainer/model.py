@@ -2,7 +2,6 @@ import os
 import pprint
 import tensorflow as tf
 import tensorflow_transform as tft
-import tensorflow_addons as tfa
 
 class CensusModel(object):
     def __init__(self,
@@ -67,41 +66,18 @@ class CensusModel(object):
         return tf.keras.Model(inputs=model.inputs, outputs=probabilities)
 
     def export_model(self, model):
-        feature_forward_keys = []
         full_model = self.attach_prediction_head(model)
 
         full_model.save(
             filepath=self.model_dir,
             overwrite=True,
-            signatures=self.get_serve_tf_examples_fn(model, feature_forward_keys),
+            signatures=self.get_serve_tf_examples_fn(model),
         )
 
 
-    def get_serve_tf_examples_fn(self, model, forwarding_keys=[]):
+    def get_serve_tf_examples_fn(self, model):
         # Returns a function that parses a serialized tf.Example and applies TFT.
         model.tft_layer = self.tft_transform_output.transform_features_layer()
-
-        @tf.function
-        def extract_forwarded_features(raw_features):
-            forwarded_features = {}
-            for key in forwarding_keys:
-                if key not in raw_features:
-                    raise ValueError(
-                        "Forwarded feature {} does not exist! Available features: {}".format(
-                            key, [*raw_features.keys()]
-                        )
-                    )
-
-                feature = raw_features[key]
-                with tf.name_scope("forward_features"):
-                    # Export signatures only take dense tensors
-                    if isinstance(feature, tf.SparseTensor):
-                        feature = tf.sparse.to_dense(feature, name="sparse_to_dense")
-
-                # Keeping the export signature for forwarded features the same as the Estimator API
-                forwarded_features[key] = tf.squeeze(feature, axis=-1)
-
-            return forwarded_features
 
         @tf.function
         def inference_model(serialized_tf_examples):
@@ -114,12 +90,12 @@ class CensusModel(object):
             )
 
             transformed_features = model.tft_layer(parsed_features)
-            forwarded_features = extract_forwarded_features(parsed_features)
-            return model(transformed_features), forwarded_features
+
+            return model(transformed_features)
 
         @tf.function
         def serving_default_signature(serialized_examples):
-            logits, forwarded_features = inference_model(serialized_examples)
+            logits = inference_model(serialized_examples)
             two_class_logits = tf.concat(
                 (tf.zeros_like(logits), logits), axis=-1, name="two_class_logits"
             )
@@ -128,12 +104,11 @@ class CensusModel(object):
                 "scores": tf.keras.layers.Softmax(name="probabilities")(
                     two_class_logits
                 ),
-                **forwarded_features,
             }
 
         @tf.function
         def predict_signature(serialized_examples):
-            logits, forwarded_features = inference_model(serialized_examples)
+            logits = inference_model(serialized_examples)
             two_class_logits = tf.concat(
                 (tf.zeros_like(logits), logits), axis=-1, name="two_class_logits"
             )
@@ -144,7 +119,6 @@ class CensusModel(object):
                 "probabilities": tf.keras.layers.Softmax(name="probabilities")(
                     two_class_logits
                 ),
-                **forwarded_features,
             }
 
         return {
@@ -213,32 +187,16 @@ class CensusModel(object):
             strategy = tf.distribute.OneDeviceStrategy("/cpu:0")
         return strategy
 
-    def get_compiled_model(self, from_saved_model=False):
+    def get_compiled_model(self):
         strategy = self.get_training_strategy()
         with strategy.scope():
             model = self.get_model()
             model.compile(
-                optimizer=self.get_optimizer(),
-                loss=self.get_loss(),
-                metrics=self.get_metrics(),
+                optimizer='adam',
+                loss='binary_crossentropy',
+                metrics=['accuracy'],
             )
         return model
-
-    def get_optimizer(self):
-        return tfa.optimizers.LazyAdam(
-            learning_rate=0.01,
-            epsilon=1e-08,
-            beta_1=0.9,
-            beta_2=0.999,
-        )
-
-    def get_loss(self):
-        return tf.keras.losses.BinaryCrossentropy()
-
-    def get_metrics(self):
-        return [
-            tf.keras.metrics.BinaryAccuracy(),
-        ]
 
     def train_and_evaluate(self):
         model = self.get_compiled_model()
