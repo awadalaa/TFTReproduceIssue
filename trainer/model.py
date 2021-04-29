@@ -2,6 +2,7 @@ import os
 import pprint
 import tensorflow as tf
 import tensorflow_transform as tft
+import tensorflow_addons as tfa
 
 class CensusModel(object):
     def __init__(self,
@@ -20,16 +21,14 @@ class CensusModel(object):
         self.train_dataset = self.get_dataset_batch(
             file_pattern=train_data_pattern,
             tft_transform_output=self.tft_transform_output,
-            batch_size=train_batch_size,
-            mode=tf.estimator.ModeKeys.TRAIN,
+            batch_size=train_batch_size
         )
         self.eval_steps = num_eval_examples // eval_batch_size
         self.eval_dataset = self.get_dataset_batch(
             file_pattern=eval_data_pattern,
             tft_transform_output=self.tft_transform_output,
             batch_size=eval_batch_size,
-            mode=tf.estimator.ModeKeys.EVAL,
-            limit=num_eval_examples,
+            limit=num_eval_examples
         )
 
     def get_dataset_batch(
@@ -37,7 +36,6 @@ class CensusModel(object):
             file_pattern: str,
             tft_transform_output: tft.TFTransformOutput,
             batch_size: int,
-            mode: tf.estimator.ModeKeys,
             limit: int = None,
     ) -> tf.data.Dataset:
         features = tft_transform_output.transformed_feature_spec()
@@ -62,26 +60,101 @@ class CensusModel(object):
 
         return dataset
 
+    def attach_prediction_head(self, model):
+        probabilities = tf.keras.layers.Activation("sigmoid", name="predictions")(
+            model.output
+        )
+        return tf.keras.Model(inputs=model.inputs, outputs=probabilities)
+
     def export_model(self, model):
+        feature_forward_keys = []
+        full_model = self.attach_prediction_head(model)
+
+        full_model.save(
+            filepath=self.model_dir,
+            overwrite=True,
+            signatures=self.get_serve_tf_examples_fn(model, feature_forward_keys),
+        )
+
+
+    def get_serve_tf_examples_fn(self, model, forwarding_keys=[]):
+        # Returns a function that parses a serialized tf.Example and applies TFT.
         model.tft_layer = self.tft_transform_output.transform_features_layer()
 
         @tf.function
-        def serve_tf_examples_fn(serialized_tf_examples):
-            feature_spec = self.tft_transform_output.raw_feature_spec().copy()
-            feature_spec.pop('label')
-            parsed_features = tf.io.parse_example(serialized_tf_examples, feature_spec)
+        def extract_forwarded_features(raw_features):
+            forwarded_features = {}
+            for key in forwarding_keys:
+                if key not in raw_features:
+                    raise ValueError(
+                        "Forwarded feature {} does not exist! Available features: {}".format(
+                            key, [*raw_features.keys()]
+                        )
+                    )
+
+                feature = raw_features[key]
+                with tf.name_scope("forward_features"):
+                    # Export signatures only take dense tensors
+                    if isinstance(feature, tf.SparseTensor):
+                        feature = tf.sparse.to_dense(feature, name="sparse_to_dense")
+
+                # Keeping the export signature for forwarded features the same as the Estimator API
+                forwarded_features[key] = tf.squeeze(feature, axis=-1)
+
+            return forwarded_features
+
+        @tf.function
+        def inference_model(serialized_tf_examples):
+            # Returns the output to be used in the serving signature.
+            raw_feature_spec = self.tft_transform_output.raw_feature_spec()
+            raw_feature_spec.pop(self.get_label_key())
+
+            parsed_features = tf.io.parse_example(
+                serialized_tf_examples, raw_feature_spec
+            )
+
             transformed_features = model.tft_layer(parsed_features)
-            outputs = model(transformed_features)
-            classes_names = tf.constant([['0', '1']])
-            classes = tf.tile(classes_names, [tf.shape(outputs)[0], 1])
-            return {'classes': classes, 'scores': outputs}
+            forwarded_features = extract_forwarded_features(parsed_features)
+            return model(transformed_features), forwarded_features
 
-        concrete_serving_fn = serve_tf_examples_fn.get_concrete_function(
-            tf.TensorSpec(shape=[None], dtype=tf.string, name='inputs'))
-        signatures = {'serving_default': concrete_serving_fn}
+        @tf.function
+        def serving_default_signature(serialized_examples):
+            logits, forwarded_features = inference_model(serialized_examples)
+            two_class_logits = tf.concat(
+                (tf.zeros_like(logits), logits), axis=-1, name="two_class_logits"
+            )
 
-        versioned_output_dir = os.path.join(self.model_dir, '1')
-        model.save(versioned_output_dir, save_format='tf', signatures=signatures)
+            return {
+                "scores": tf.keras.layers.Softmax(name="probabilities")(
+                    two_class_logits
+                ),
+                **forwarded_features,
+            }
+
+        @tf.function
+        def predict_signature(serialized_examples):
+            logits, forwarded_features = inference_model(serialized_examples)
+            two_class_logits = tf.concat(
+                (tf.zeros_like(logits), logits), axis=-1, name="two_class_logits"
+            )
+
+            return {
+                "logits": logits,
+                "logistic": tf.keras.layers.Activation("sigmoid")(logits),
+                "probabilities": tf.keras.layers.Softmax(name="probabilities")(
+                    two_class_logits
+                ),
+                **forwarded_features,
+            }
+
+        return {
+            "serving_default": serving_default_signature.get_concrete_function(
+                tf.TensorSpec(shape=[None], dtype=tf.string, name="inputs")
+            ),
+            "predict": predict_signature.get_concrete_function(
+                tf.TensorSpec(shape=[None], dtype=tf.string, name="examples")
+            ),
+        }
 
     def get_label_key(self):
         return "label"
@@ -124,10 +197,9 @@ class CensusModel(object):
         )(feature_inputs)
 
         output = tf.keras.layers.Dense(100, activation='relu')(feature_layer)
-        output = tf.keras.layers.Dense(70, activation='relu')(output)
         output = tf.keras.layers.Dense(50, activation='relu')(output)
         output = tf.keras.layers.Dense(20, activation='relu')(output)
-        output = tf.keras.layers.Dense(2, activation='sigmoid')(output)
+        output = tf.keras.layers.Dense(1, name="logits")(output)
         model = tf.keras.Model(inputs=feature_inputs, outputs=output)
         return model
 
@@ -146,20 +218,36 @@ class CensusModel(object):
         with strategy.scope():
             model = self.get_model()
             model.compile(
-                optimizer='adam',
-                loss='binary_crossentropy',
-                metrics=['accuracy'],
+                optimizer=self.get_optimizer(),
+                loss=self.get_loss(),
+                metrics=self.get_metrics(),
             )
         return model
 
+    def get_optimizer(self):
+        return tfa.optimizers.LazyAdam(
+            learning_rate=0.01,
+            epsilon=1e-08,
+            beta_1=0.9,
+            beta_2=0.999,
+        )
+
+    def get_loss(self):
+        return tf.keras.losses.BinaryCrossentropy()
+
+    def get_metrics(self):
+        return [
+            tf.keras.metrics.BinaryAccuracy(),
+        ]
+
     def train_and_evaluate(self):
-        print("AWADALAA  train_and_evaluate")
         model = self.get_compiled_model()
-        print(f"AWADALAA epochs:{self.num_epochs} dataset:{self.eval_dataset} train:{self.train_dataset}")
         model.summary()
+
         for x, y in self.train_dataset.take(1):
-            print("AWADALAA FEATURES:")
+            print("TRANSORMED FEATURES:")
             pprint.pprint(x)
+
         history = model.fit(
             self.train_dataset,
             epochs=self.num_epochs,
